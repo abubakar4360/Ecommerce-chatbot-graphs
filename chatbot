@@ -1,0 +1,118 @@
+import requests
+from bs4 import BeautifulSoup
+from sentence_transformers import SentenceTransformer
+import faiss
+import numpy as np
+from openai import OpenAI
+import os
+from langchain.chains import ConversationChain
+from langchain.memory import ConversationBufferWindowMemory
+from langchain_openai import ChatOpenAI
+import warnings
+from langchain_core._api.deprecation import LangChainDeprecationWarning
+
+# Ignore LangChainDeprecationWarning
+warnings.filterwarnings("ignore", category=LangChainDeprecationWarning)
+
+os.environ['OPENAI_API_KEY'] = 'openai-api-key-here'
+
+
+# Load and scrape the website content from multiple URLs
+def load_website_content(urls):
+    all_content = []
+    for url in urls:
+        response = requests.get(url)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.content, 'html.parser')
+
+        # Extract text content from the page
+        elements = soup.find_all(['p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'span', 'div', 'li', 'a'])
+        content = " ".join([element.get_text().strip() for element in elements])
+        all_content.append(content)
+
+    combined_content = " ".join(all_content)
+    return combined_content
+
+
+# Chunk the content
+def chunk_text(text, chunk_size=512):
+    words = text.split()
+    chunks = [" ".join(words[i:i + chunk_size]) for i in range(0, len(words), chunk_size)]
+    return chunks
+
+
+# Encode and store the chunks in a vector database
+def store_chunks_in_vector_db(model, chunks):
+    # Encode chunks to vectors
+    vectors = model.encode(chunks)
+
+    # Normalize vectors for better performance
+    faiss.normalize_L2(vectors)
+
+    # Create a FAISS index and add vectors
+    dimension = vectors.shape[1]
+    index = faiss.IndexFlatL2(dimension)
+    index.add(vectors)
+
+    return index
+
+
+# Search from vector db
+def query_vector_db(prompt, k=3):
+    prompt_vector = model.encode([prompt])
+    faiss.normalize_L2(prompt_vector)
+    distances, indices = index.search(prompt_vector, k)
+    retrieved_chunks = [chunks[idx] for idx in indices[0]]
+    return retrieved_chunks
+
+
+if __name__ == "__main__":
+    urls = [
+        "https://www.darimooch.com/",
+        "https://www.darimooch.com/collections/all-products?page=1",
+        "https://www.darimooch.com/collections/all-products?page=2",
+        "https://www.darimooch.com/collections/all-products?page=3",
+        "https://www.darimooch.com/collections/azadi-bundles",
+        "https://www.darimooch.com/blogs/how-to-use/hair-clay-wax",
+        "https://www.darimooch.com/blogs/how-to-use/how-to-use-face-wash",
+        "https://www.darimooch.com/blogs/how-to-use/how-to-use-hair-clay-wax",
+        "https://www.darimooch.com/blogs/how-to-use/how-to-use-face-mask",
+        "https://www.darimooch.com/collections/all-products/products/charcoal-facewash"
+    ]
+    model = SentenceTransformer('all-MiniLM-L6-v2')  # Load a pre-trained sentence transformer model
+    faiss_index = "darimooch_index.faiss"  # FAISS index file
+
+    # Load system prompt
+    with open('prompt.txt', 'r') as f:
+        system = f.read()
+
+    content = load_website_content(urls)  # Load content from multiple URLs
+    chunks = chunk_text(content)  # Chunk the combined content
+    index = store_chunks_in_vector_db(model, chunks)  # Store in vector database
+
+    # Save the index for use
+    faiss.write_index(index, faiss_index)
+    print(f"Stored {len(chunks)} chunks in the vector database.")
+
+    # Set up LangChain's conversation chain with memory
+    memory = ConversationBufferWindowMemory(k=3)
+    llm = ChatOpenAI(model_name="gpt-4o", openai_api_key=os.getenv('OPENAI_API_KEY'))
+    conversation = ConversationChain(llm=llm, memory=memory)
+
+    # Interactive loop with conversation memory
+    while True:
+        user_prompt = input('Enter your query: ')
+
+        if user_prompt.lower() == 'exit':
+            break
+
+        retrieved_chunks = query_vector_db(user_prompt)
+        context = "\n".join(retrieved_chunks)
+
+        # Combine retrieved chunks with user prompt for context
+        final_prompt = f"{context}\n\n{user_prompt}"
+
+        # Use LangChain's conversation chain to get the response
+        response = conversation.run(input=final_prompt)
+
+        print("Answer:", response)
